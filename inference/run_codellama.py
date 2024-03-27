@@ -344,7 +344,7 @@ def main(
     load_in_4bit = True # Use 4bit quantization to reduce memory usage. Can be False.
 
     model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name = "unsloth/codellama-34b-bnb-4bit", # "codellama/CodeLlama-34b-hf" for 16bit loading
+        model_name = model_name_or_path,
         max_seq_length = max_seq_length,
         dtype = dtype,
         load_in_4bit = load_in_4bit,
