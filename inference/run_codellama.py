@@ -25,11 +25,11 @@ DEVICE_MAPS = json.load(open("codellama_device_maps.json"))
 
 
 from pathlib import Path
+from unsloth import FastLanguageModel
 
 def get_output_file(
     output_dir,
     model_name_or_path,
-    peft_path,
     dataset_path,
     split,
     temperature,
@@ -45,7 +45,6 @@ def get_output_file(
     Args:
         output_dir (str): The directory where the output file will be saved.
         model_name_or_path (str): The name or path of the model.
-        peft_path (str): The path to the PEFT file.
         dataset_path (str): The path to the dataset.
         split (str): The dataset split.
         temperature (float): The temperature value.
@@ -69,11 +68,7 @@ def get_output_file(
         dset_nickname = Path(dataset_path).name + "__" + split
     else:
         dset_nickname = dataset_path.replace("/", "__") + "__" + split
-    if peft_path is not None and "checkpoint" in Path(peft_path).name:
-        model_nickname = Path(peft_path).parent.name + "__" + Path(peft_path).name
-    elif peft_path is not None:
-        model_nickname = Path(peft_path).name
-    elif Path(model_name_or_path).exists():
+    if Path(model_name_or_path).exists():
         if "checkpoint" in Path(model_name_or_path).name:
             model_nickname = Path(model_name_or_path).parent.name + "__" + Path(model_name_or_path).name
         else:
@@ -99,13 +94,12 @@ def get_output_file(
     return output_file
 
 
-def load_model(model_name_or_path, peft_path):
+def load_model(model_name_or_path):
     """
     Loads a base model and optionally PEFT adapters.
 
     Args:
         model_name_or_path (str): The name or path of the base model.
-        peft_path (str or None): The path to the PEFT adapters. If None, no PEFT adapters will be loaded.
 
     Returns:
         model: The loaded model.
@@ -137,17 +131,7 @@ def load_model(model_name_or_path, peft_path):
         device_map=device_map,
         torch_dtype=torch.bfloat16,
     ).eval()
-    if peft_path is None:
-        logger.info(f"No PEFT adapters to load")
-        return model
-    logger.info(f"Loading PEFT adapters from {peft_path}")
-    model = PeftModel.from_pretrained(
-        model,
-        peft_path,
-        device_map=device_map,
-        torch_dtype=torch.bfloat16,
-        max_memory=max_memory,
-    )
+
     return model
 
 
@@ -158,7 +142,7 @@ def load_tokenizer(model_name_or_path):
 
 
 def load_data(
-    dataset_path, split, tokenizer, min_len, max_len, model_name_or_path, peft_path, existing_ids, shard_id, num_shards
+    dataset_path, split, tokenizer, min_len, max_len, model_name_or_path, existing_ids, shard_id, num_shards
 ):
     """
     Load and preprocess the dataset for model inference.
@@ -170,7 +154,6 @@ def load_data(
         min_len (int): The minimum length of input sequences to include in the dataset.
         max_len (int): The maximum length of input sequences to include in the dataset.
         model_name_or_path (str): The name or path of the model.
-        peft_path (str): The path to the PEFT file.
         existing_ids: The list of existing instance IDs to filter out from the dataset.
         shard_id (int): The ID of the shard to load.
         num_shards (int): The total number of shards.
@@ -185,10 +168,6 @@ def load_data(
         dataset = load_from_disk(Path(dataset_path) / split)
     else:
         dataset = load_dataset(dataset_path)[split]
-    if peft_path is not None:
-        model_nickname = "__".join(peft_path.split("/")[-2:])
-    else:
-        model_nickname = "__".join(model_name_or_path.split("/")[-2:])
     if "input_ids" not in dataset.column_names:
         dataset = dataset.map(
             lambda x: tokenizer(x["text"], truncation=False),
@@ -231,7 +210,7 @@ def load_data(
     return dataset
 
 
-def generate(model, dataset, tokenizer, temperature, top_p, fileobj, peft_path):
+def generate(model, dataset, tokenizer, temperature, top_p, fileobj,model_name_or_path):
     class RepeatingTokensCriteria(StoppingCriteria):
         """
         Stopping criteria based on repeating tokens in the generated sequence.
@@ -300,7 +279,7 @@ def generate(model, dataset, tokenizer, temperature, top_p, fileobj, peft_path):
                     "instance_id": instance["instance_id"],
                     "full_output": output,
                     "model_patch": diff,
-                    "model_name_or_path": peft_path,
+                    "model_name_or_path": Path(model_name_or_path).name,
                 }
                 print(json.dumps(res), file=fileobj, flush=True)
             except Exception as e:
@@ -333,7 +312,6 @@ def get_all_existing_ids(output_file):
 
 def main(
     model_name_or_path,
-    peft_path,
     dataset_path,
     split,
     temperature,
@@ -348,17 +326,9 @@ def main(
         raise ValueError("num_shards must be specified with shard_id")
     if shard_id is None and num_shards is not None:
         raise ValueError("shard_id must be specified with num_shards")
-    peft_config = None
-    if peft_path is not None:
-        peft_config = PeftConfig.from_pretrained(peft_path)
-        if peft_config.base_model_name_or_path != model_name_or_path:
-            logger.warning(
-                f"model_name_or_path {model_name_or_path} does not match peft_path base_model {peft_config.base_model_name_or_path}"
-            )
     output_file = get_output_file(
         output_dir=output_dir,
         model_name_or_path=model_name_or_path,
-        peft_path=peft_path,
         dataset_path=dataset_path,
         split=split,
         temperature=temperature,
@@ -369,8 +339,29 @@ def main(
         num_shards=num_shards,
     )
     logger.warning(f"output_file: {output_file}")
-    model = load_model(model_name_or_path, peft_path)
-    tokenizer = load_tokenizer(model_name_or_path)
+    max_seq_length = 2048 # Choose any! We auto support RoPE Scaling internally!
+    dtype = None # None for auto detection. Float16 for Tesla T4, V100, Bfloat16 for Ampere+
+    load_in_4bit = True # Use 4bit quantization to reduce memory usage. Can be False.
+
+    model, tokenizer = FastLanguageModel.from_pretrained(
+        model_name = "unsloth/codellama-34b-bnb-4bit", # "codellama/CodeLlama-34b-hf" for 16bit loading
+        max_seq_length = max_seq_length,
+        dtype = dtype,
+        load_in_4bit = load_in_4bit,
+        # token = "hf_...", # use one if using gated models like meta-llama/Llama-2-7b-hf
+    )
+    model = FastLanguageModel.get_peft_model(
+        model,
+        r = 16, # Choose any number > 0 ! Suggested 8, 16, 32, 64, 128
+        target_modules = ["q_proj", "k_proj", "v_proj", "o_proj",
+                        "gate_proj", "up_proj", "down_proj",],
+        lora_alpha = 16,
+        lora_dropout = 0, # Currently only supports dropout = 0
+        bias = "none",    # Currently only supports bias = "none"
+        use_gradient_checkpointing = True,
+        random_state = 3407,
+        max_seq_length = max_seq_length,
+    )
     existing_ids = get_all_existing_ids(output_file)
     dataset = load_data(
         dataset_path=dataset_path,
@@ -379,7 +370,6 @@ def main(
         min_len=min_len,
         max_len=max_len,
         model_name_or_path=model_name_or_path,
-        peft_path=peft_path,
         existing_ids=existing_ids,
         shard_id=shard_id,
         num_shards=num_shards,
@@ -392,15 +382,15 @@ def main(
             temperature=temperature,
             top_p=top_p,
             fileobj=f,
-            peft_path=peft_path,
+            model_name_or_path=model_name_or_path,
         )
+
     logger.info(f"Done")
 
 
 if __name__ == "__main__":
     parser = ArgumentParser()
     parser.add_argument("--model_name_or_path", type=str, required=True, help="Path to model or hf model name")
-    parser.add_argument("--peft_path", type=str, help="Path to PEFT adapters")
     parser.add_argument("--dataset_path", type=str, required=True, help="Path to dataset or hf dataset name")
     parser.add_argument("--split", type=str, default="test", help="Dataset split to use")
     parser.add_argument("--output_dir", type=str, default="./outputs")
